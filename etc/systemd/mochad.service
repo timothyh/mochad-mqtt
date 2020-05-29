@@ -1,0 +1,14 @@
+[Unit]
+Description=Start mochad service
+
+[Service]
+ExecStart=/usr/local/bin/mochad -d --raw-data
+ExecStartPost=-/bin/sleep 5
+ExecStartPost=/opt/mochad-mqtt/bin/mochad-time.pl --set
+Type=simple
+StandardError=null
+Restart=always
+
+
+[Install]
+WantedBy=multi-user.target

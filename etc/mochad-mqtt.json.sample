@@ -1,0 +1,71 @@
+//
+// Sample configuration file.
+//
+// Copy to mochad-mqtt.json, remove these comments and edit to match your configuration
+//
+// This needs to be a properly formatted JSON file. "jq" is your friend. To validate file:-
+// $ jq . < mochad-mqtt.json
+//
+{
+  "devices": {
+    "backyard_duskdawn": {
+      "code": "D7",
+      "retain": true,
+      "type": "REMOTE2"
+    },
+    "backyard_lights": {
+      "code": "D2",
+      "type": "StdAM"
+    },
+    "backyard_motion": {
+      "code": "D6",
+      "type": "REMOTE2"
+    },
+    "backyard_outlet": {
+      "code": "D1",
+      "type": "StdAM"
+    },
+    "backyard_speakers": {
+      "code": "P5",
+      "type": "StdAM"
+    },
+    "front_door_motion": {
+      "code": "D8",
+      "type": "REMOTE2"
+    },
+    "livingroom_1": {
+      "code": "N1",
+      "type": "StdLM"
+    },
+    "livingroom_2": {
+      "code": "N2",
+      "type": "StdLM"
+    },
+    "lowerdoor_light": {
+      "code": "K2",
+      "type": "StdAM"
+    },
+    "lr_remote_1": {
+      "code": "M1",
+      "type": "REMOTE2"
+    },
+    "lr_remote_2": {
+      "code": "M2",
+      "type": "REMOTE2"
+    }
+  },
+  "ignore": [
+    "P16"
+  ],
+  "mochad": {
+    "host": "localhost",
+    "port": 1099
+  },
+  "mqtt": {
+    "host": "localhost",
+    "password": "not-a-password",
+    "ping": "ping/x10/_ping",
+    "prefix": "home/x10",
+    "user": "x10"
+  }
+}

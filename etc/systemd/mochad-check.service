@@ -1,0 +1,10 @@
+[Unit]
+Description=Monitor Mochad and restart if needed
+After=mochad.service
+Wants=mochad-check.timer
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/opt/mochad-mqtt/bin/mochad-check.sh
+WorkingDirectory=/opt/mochad-mqtt

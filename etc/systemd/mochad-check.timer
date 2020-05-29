@@ -1,0 +1,9 @@
+[Unit]
+Description=Monitor Mochad and restart if needed
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=240
+
+[Install]
+WantedBy=multi-user.target

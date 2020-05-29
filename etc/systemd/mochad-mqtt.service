@@ -1,0 +1,15 @@
+[Unit]
+Description=Start mochad to mqtt service
+Requires=mochad.service
+After=mochad.service
+
+[Service]
+EnvironmentFile=-/etc/default/mochad-mqtt
+ExecStart=/opt/mochad-mqtt/bin/mochad-mqtt.pl
+ExecReload=/bin/kill $MAINPID
+WorkingDirectory=/opt/mochad-mqtt
+Type=simple
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

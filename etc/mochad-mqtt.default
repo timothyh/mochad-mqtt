@@ -1,0 +1,4 @@
+AE_LOG="filter=info"
+MM_TOTAL_INSTANCES=2
+MM_INSTANCE=2
+MM_CONFIG=/opt/mochad-mqtt/etc/mochad-mqtt.json
