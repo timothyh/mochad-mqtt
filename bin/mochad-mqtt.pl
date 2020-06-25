@@ -10,6 +10,7 @@ use strict;
 use Data::Dumper;
 use Time::HiRes qw(usleep sleep);
 use POSIX qw(strftime);
+use File::stat;
 
 use File::Basename;
 
@@ -17,7 +18,6 @@ use AnyEvent;
 use AnyEvent::MQTT;
 use AnyEvent::Socket;
 use AnyEvent::Strict;
-use AnyEvent::Filesys::Notify;
 
 use JSON::PP;
 
@@ -81,6 +81,7 @@ my %alias;
 my $mqtt_updated;
 my $mochad_updated;
 my $config_updated;
+my $config_mtime;
 
 my $handle;
 
@@ -180,6 +181,7 @@ sub read_config {
     #exit 0;
 ############################################################################
 
+    $config_mtime   = stat($mm_config)->mtime;
     $config_updated = Time::HiRes::time;
 
     # Environment overrides config file
@@ -191,6 +193,14 @@ sub read_config {
     foreach (@boolopts) {
         $config{$_} = is_true( $config{$_} );
     }
+}
+
+sub changed_config {
+    if ( stat($mm_config)->mtime > $config_mtime ) {
+        AE::log alert => "Config file $mm_config changed";
+        return 1;
+    }
+    return 0;
 }
 
 sub is_true {
@@ -592,18 +602,16 @@ my $basename = basename($mm_config);
 
 AE::log debug => "Watch config file $dirname $basename";
 
-my $monitor = AnyEvent::Filesys::Notify->new(
-    dirs   => [$dirname],
-    filter => qr/${basename}$/,
-    cb     => sub {
-        my (@events) = @_;
+my $conf_monitor = AnyEvent->timer(
+    after    => 30.0,
+    interval => 60.0,
+    cb       => sub {
+        if ( changed_config() ) {
+            AE::log error => "$mm_config updated - Exiting";
 
-        AE::log debug => Dumper(@events);
-
-        AE::log error => "$mm_config updated - Exiting";
-
-        # Safer to just restart
-        exit(0);
+            # Safer to just restart
+            exit(10);
+        }
     },
 );
 
