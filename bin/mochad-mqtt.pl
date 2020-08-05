@@ -27,22 +27,26 @@ my @fromenv =
   qw(MQTT_HOST MQTT_PORT MQTT_USER MQTT_PASSWORD MQTT_PREFIX MOCHAD_HOST MOCHAD_PORT MM_TOTAL_INSTANCES MM_INSTANCE MM_DELAY);
 
 my %config = (
-    mqtt_host   => 'localhost',
-    mqtt_port   => '1883',
-    mqtt_prefix => 'home/x10',
-    mqtt_ping   => 'ping/home/x10/_ping',
-    mqtt_idle   => 300.0,
-    mochad_host => 'localhost',
-    mochad_port => '1100',
-    mochad_idle => 300.0,
-    passthru    => 0,                       # Publish all input from Mochad
+    hass_discovery_enable => 0,
+    hass_id_prefix        => "x10",
+    hass_retain           => 0,
+    mqtt_host             => 'localhost',
+    mqtt_port             => '1883',
+    mqtt_prefix           => 'home/x10',
+    mqtt_ping             => 'ping/home/x10/_ping',
+    mqtt_idle             => 300.0,
+    mochad_host           => 'localhost',
+    mochad_port           => '1100',
+    mochad_idle           => 300.0,
+    passthru           => 0,     # Publish all input from Mochad
     passthru_send      => 1,     # Allow commands to pass directly to Mochad
     mm_total_instances => 2,
     mm_instance        => 1,     # Instance number - offset 1
     mm_delay           => 0.2,
+    slug_separator     => '-',
 );
 
-my @boolopts = qw( passthru passthru_send);
+my @boolopts = qw(hass_discovery_enable hass_retain passthru passthru_send);
 
 # Mapping of input commands to Mochad usage
 my %cmds = (
@@ -71,7 +75,7 @@ my %appls;
 my %ignore;
 
 # house codes => alias
-my %codes;
+my %devcodes;
 
 my %retain;
 
@@ -92,13 +96,13 @@ sub read_config {
     close CONFIG;
     my $conf = JSON::PP->new->decode($conf_text);
 
-    %alias  = ();
-    %appls  = ();
-    %codes  = ();
-    %lights = ();
-    %retain = ();
+    %alias    = ();
+    %devcodes = ();
+    %appls    = ();
+    %lights   = ();
+    %retain   = ();
 
-    for my $sect ( 'mm', 'mochad', 'mqtt' ) {
+    for my $sect ( 'hass', 'mm', 'mochad', 'mqtt' ) {
         next unless ( exists $conf->{$sect} );
         my %tmp = %{ $conf->{$sect} };
         foreach my $key ( keys %tmp ) {
@@ -123,45 +127,61 @@ sub read_config {
     }
     delete $conf->{'ignore'};
     for my $alias ( keys %{ $conf->{'devices'} } ) {
-        my %tmp = %{ $conf->{devices}{$alias} };
-
-        my $code    = defined $tmp{'code'} ? uc $tmp{'code'} : $alias;
-        my $aliased = ( lc $alias ne lc $code );
-        my $type    = defined $tmp{'type'} ? lc $tmp{'type'} : '';
-        my $retain  = is_true( $tmp{'retain'} );
-
-        unless ( $code =~ m{([A-Za-z])([\d,-]+)} ) {
-            AE::log error => "Bad device definition: $code => "
-              . Dumper( \%tmp );
+        if ( length($alias) <= 2 ) {
+            AE::log error => "Name length must be 3 chars or more: $alias";
             next;
         }
-        my $house = uc $1;
-        my @codes = str_range($2);
+        my %tmp = %{ $conf->{devices}{$alias} };
 
-        if ($aliased) {
-            $alias = lc $alias;
-            $alias =~ s/[^0-9a-z]+/-/g;
-            $alias{$alias} = () unless defined $alias{$alias};
+        my $type = defined $tmp{'type'} ? lc $tmp{'type'} : '';
+        my $retain = is_true( $tmp{'retain'} );
 
-            $retain{$alias} = 1 if ($retain);
+        my @devcodes;
+
+        my @tmpcode = defined $tmp{'codes'} ? $tmp{'codes'} : ();
+        push( @tmpcode, $tmp{'code'} ) if ( defined $tmp{'code'} );
+
+        my $err = 0;
+        for my $code (@tmpcode) {
+            $code = uc $code;
+            unless ( $code =~ m{([A-Za-z])([\d,-]+)} ) {
+                AE::log error => "Bad device definition: $code";
+                $err = 1;
+            }
+            my $house = uc $1;
+            my @codes = str_range($2);
+            foreach my $i ( 0 .. scalar @codes ) {
+                next unless ( $codes[$i] );
+                push( @devcodes, $house . $i );
+                if ( defined $types{$type} ) {
+                    $lights{$house}{$i} = 1 if ( $types{$type} == 2 );
+                    $appls{$house}{$i}  = 1 if ( $types{$type} >= 1 );
+                }
+            }
         }
 
-        foreach my $i ( 0 .. scalar @codes ) {
-            next unless ( $codes[$i] );
-
-            if ($aliased) {
-                $codes{ $house . $i } = $alias;
-                push( @{ $alias{$alias} }, $house . $i );
-            }
-            else {
-                $retain{"$house$i"} = 1 if ($retain);
-            }
-
-            next unless ( defined $types{$type} );
-
-            $lights{$house}{$i} = 1 if ( $types{$type} == 2 );
-            $appls{$house}{$i}  = 1 if ( $types{$type} >= 1 );
+        if ($err) {
+            AE::log error => Dumper( \%tmp );
+            next;
         }
+
+        my $name = defined $tmp{'name'} ? $tmp{'name'} : $alias;
+        $alias = lc $alias;
+        $alias =~ s/[^0-9a-z]+/$config{slug_separator}/g;
+        $alias{$alias} = {} unless defined $alias{$alias};
+        $alias{$alias}{'codes'} = ();
+        push( @{ $alias{$alias}{'codes'} }, sort @devcodes );
+
+        $retain{$alias} = 1 if ($retain);
+        $alias{$alias}{'retain'} = $retain;
+        $alias{$alias}{'name'}   = $name;
+        $alias{$alias}{'type'}   = $type;
+
+        for my $code (@devcodes) {
+            $devcodes{$code} = $alias;
+            $retain{$code} = 1 if ($retain);
+        }
+
     }
     delete $conf->{'devices'};
 
@@ -170,8 +190,8 @@ sub read_config {
     }
 
 ############################################################################
-    #print "alias: ".Dumper(\%alias);
-    #print "codes: ".Dumper(\%codes);
+    #print "alias: " . Dumper( \%alias );
+    #print "devcodes: ".Dumper(\%devcodes);
     #print "ignore: ".Dumper(\%ignore);
     #print "retain: ".Dumper(\%retain);
     #print "appliances: ".Dumper(\%appls);
@@ -319,12 +339,28 @@ sub receive_mqtt_ping {
     $mqtt_updated = AnyEvent->now;
 }
 
+sub receive_hass_startup {
+    my ( $topic, $payload ) = @_;
+
+    $mqtt_updated = AnyEvent->now;
+
+    AE::log debug => "Received topic: \"$topic\" payload: \"$payload\"";
+
+    chomp $payload;
+
+    return unless ( lc($payload) eq lc( $config{hass_startup_payload} ) );
+
+    AE::log info => "Home assistant restarted";
+
+    hass_publish_all();
+}
+
 sub receive_mqtt_set {
     my ( $topic, $payload ) = @_;
 
     $mqtt_updated = AnyEvent->now;
 
-    $topic =~ m{\Q$config{mqtt_prefix}\E/([\w-]+)/set}i;
+    $topic =~ m{\Q$config{mqtt_prefix}\E/([^/]+)/set}i;
     my $device = lc $1;
 
     ( $device eq '_ping' ) && return;
@@ -340,12 +376,12 @@ sub receive_mqtt_set {
         return;
     }
 
-    $device =~ s/[^0-9a-z]+/-/g;
+    $device =~ s/[^0-9a-z]+/$config{slug_separator}/g;
 
     if ( defined $cmds{$payload} ) {
         if ( defined $alias{$device} ) {
-            foreach ( @{ $alias{$device} } ) {
-                unless ( $ignore{$device} ) {
+            foreach ( @{ $alias{$device}{codes} } ) {
+                unless ( $ignore{$_} ) {
                     AE::log info =>
                       "Switching device $_ $payload => $cmds{$payload}";
                     delay_write( $handle,
@@ -484,8 +520,8 @@ sub process_x10_cmd {
         $status{'instance'}  = $config{mm_instance};
 
         my $alias;
-        if ( defined $codes{ uc $device } ) {
-            $alias = $codes{ uc $device };
+        if ( defined $devcodes{ uc $device } ) {
+            $alias = $devcodes{ uc $device };
             $status{'alias'} = $alias;
         }
         else {
@@ -522,7 +558,7 @@ sub process_x10_cmd {
         for my $i (@unitcodes) {
             $status{'unitcode'} = $i;
             my $alias = "$house$i";
-            $alias = $codes{$alias} if defined $codes{$alias};
+            $alias = $devcodes{$alias} if defined $devcodes{$alias};
             $status{'alias'} = $alias;
             send_mqtt_status( $alias, \%status );
         }
@@ -566,8 +602,62 @@ if ( $config{passthru_send} ) {
       );
 }
 
-#print Dumper \%config, \%lights, \%appls, \%codes, \%alias;
+if ( $config{hass_discovery_enable} ) {
+    $mqtt->subscribe(
+        topic    => "$config{hass_status_topic}",
+        callback => \&receive_hass_startup,
+      )->cb(
+        sub {
+            AE::log note =>
+              "subscribed to MQTT topic $config{hass_status_topic}";
+            hass_publish_all();
+        }
+      );
+}
+
+#print Dumper \%config, \%lights, \%appls, \%devcodes, \%alias;
 AE::log debug => Dumper( \%config );
+
+sub hass_publish_all() {
+    for my $alias ( sort( keys %alias ) ) {
+        my %tmp = %{ $alias{$alias} };
+
+        my $type = defined $types{ $tmp{type} } ? $types{ $tmp{type} } : 0;
+        my $hass_type = '';
+        if    ( $type == 2 ) { $hass_type = 'light'; }
+        elsif ( $type == 1 ) { $hass_type = 'switch'; }
+        else                 { next; }
+
+        my $id =
+            $config{hass_id_prefix}
+          . $config{slug_separator}
+          . $hass_type
+          . $config{slug_separator}
+          . $alias;
+
+        my %attr = (
+            command_topic => $config{mqtt_prefix} . '/' . $alias . '/set',
+            device        => {
+                identifiers => $id,
+                name        => $tmp{name}
+            },
+            name        => $tmp{name},
+            payload_off => 'off',
+            payload_on  => 'on',
+            state_topic => $config{mqtt_prefix} . '/' . $alias . '/state',
+            unique_id   => $id
+        );
+
+        $mqtt->publish(
+            topic => $config{hass_topic_prefix} . '/'
+              . $hass_type . '/'
+              . $alias
+              . '/config',
+            message => JSON::PP->new->utf8->canonical->encode( \%attr ),
+            retain  => $config{hass_retain},
+        );
+    }
+}
 
 # first, connect to the host
 $handle = new AnyEvent::Handle
