@@ -54,6 +54,12 @@
       "type": "REMOTE2"
     }
   },
+ "hass": {
+    "discovery_enable": true,
+    "startup_payload": "online",
+    "status_topic": "homeassistant/status",
+    "topic_prefix": "homeassistant"
+  },
   "ignore": [
     "P16"
   ],
