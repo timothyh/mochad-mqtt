@@ -27,6 +27,7 @@ my @fromenv =
   qw(MQTT_HOST MQTT_PORT MQTT_USER MQTT_PASSWORD MQTT_PREFIX MOCHAD_HOST MOCHAD_PORT MM_TOTAL_INSTANCES MM_INSTANCE MM_DELAY);
 
 my %config = (
+    cache_dir             => './cache',
     hass_discovery_enable => 0,
     hass_id_prefix        => "x10",
     hass_retain           => 0,
@@ -78,6 +79,8 @@ my %ignore;
 my %devcodes;
 
 my %retain;
+
+my %states;
 
 # device names from mochad-mqtt.json => topics from mqtt
 my %alias;
@@ -408,23 +411,49 @@ sub receive_mqtt_set {
     }
 }
 
+sub store_state {
+    my ( $device, $state ) = @_;
+
+    return if ( defined( $states{$device} ) && $states{$device} eq $state );
+
+    $states{$device} = $state;
+
+    my $cache = $config{cache_dir} . '/states.json';
+    if ( open( FH, '>', $cache ) ) {
+        print FH JSON::PP->new->utf8->canonical->pretty->encode( \%states );
+        close(FH);
+    }
+    else {
+        AE::log error => "Unable to open $cache: $!";
+    }
+}
+
+my $prev_text = '';
+
 sub send_mqtt_status {
     my ( $device, $status ) = @_;
 
     return if ( $ignore{$device} );
 
-    # Short form
-    send_mqtt_message( "$device/state", $status->{state}, 0 )
-      if ( defined( $status->{state} ) );
+    my $json_text = JSON::PP->new->utf8->canonical->encode($status);
+
+    # Simplistic duplicate suppression
+    return if ( $json_text eq $prev_text );
+
+    if ( defined( $status->{state} ) ) {
+
+        # Short form
+        send_mqtt_message( "$device/state", $status->{state}, 0 );
+        store_state( $device, $status->{'state'} );
+    }
 
     # Long form
     my $retain = $retain{$device} ? 1 : 0;
 
     AE::log debug => "$device retain: $retain";
 
-    my $json_text = JSON::PP->new->utf8->canonical->encode($status);
-
     send_mqtt_message( $device, $json_text, $retain );
+    $prev_text = $json_text;
 }
 
 sub send_mqtt_message {
@@ -628,12 +657,7 @@ sub hass_publish_all() {
         elsif ( $type == 1 ) { $hass_type = 'switch'; }
         else                 { next; }
 
-        my $id =
-            $config{hass_id_prefix}
-          . $config{slug_separator}
-          . $hass_type
-          . $config{slug_separator}
-          . $alias;
+        my $id = $config{hass_id_prefix} . '.' . $hass_type . '.' . $alias;
 
         my %attr = (
             command_topic => $config{mqtt_prefix} . '/' . $alias . '/set',
