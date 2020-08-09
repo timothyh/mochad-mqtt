@@ -31,6 +31,9 @@ my %config = (
     hass_discovery_enable => 0,
     hass_id_prefix        => "x10",
     hass_retain           => 0,
+    mm_total_instances    => 2,
+    mm_instance           => 1,                     # Instance number - offset 1
+    mm_delay              => 0.2,
     mqtt_host             => 'localhost',
     mqtt_port             => '1883',
     mqtt_prefix           => 'home/x10',
@@ -39,15 +42,18 @@ my %config = (
     mochad_host           => 'localhost',
     mochad_port           => '1100',
     mochad_idle           => 300.0,
-    passthru           => 0,     # Publish all input from Mochad
-    passthru_send      => 1,     # Allow commands to pass directly to Mochad
-    mm_total_instances => 2,
-    mm_instance        => 1,     # Instance number - offset 1
-    mm_delay           => 0.2,
-    slug_separator     => '-',
+    passthru      => 0,    # Publish all input from Mochad
+    passthru_send => 1,    # Allow commands to pass directly to Mochad
+    perl_anyevent_log => 'filter=info',
+    repeat_interval   => 1,
+    slug_separator    => '-',
+    verbose           => 0,
 );
 
-my @boolopts = qw(hass_discovery_enable hass_retain passthru passthru_send);
+my @boolopts =
+  qw(hass_discovery_enable hass_retain passthru passthru_send verbose);
+
+my $verbose = 0;
 
 # Mapping of input commands to Mochad usage
 my %cmds = (
@@ -63,8 +69,16 @@ my %cmds = (
 
 # 1 => appliance, 2 => light
 #
-# Device types 1 == appliance, 2 == light
-my %types = ( stdam => 1, stdlm => 2, appliance => 1, light => 2 );
+# Device types 1 == appliance, 2 == light, 3 => sensor, 4 => remote/scene controller
+my %types = (
+    sensor    => 3,
+    stdam     => 1,
+    stdlm     => 2,
+    appliance => 1,
+    light     => 2,
+    remote    => 4,
+    remote2   => 4
+);
 
 # List of all lights
 my %lights;
@@ -85,6 +99,7 @@ my %states;
 # device names from mochad-mqtt.json => topics from mqtt
 my %alias;
 
+my $mqtt;
 my $mqtt_updated;
 my $mochad_updated;
 my $config_updated;
@@ -92,12 +107,18 @@ my $config_mtime;
 
 my $handle;
 
-sub read_config {
+sub read_config_file {
 
-    return undef unless ( open CONFIG, "<" . $mm_config );
+    die "Unable to read config file: $mm_config\n"
+      unless ( open CONFIG, '<' . $mm_config );
     my $conf_text = join( '', <CONFIG> );
     close CONFIG;
     my $conf = JSON::PP->new->decode($conf_text);
+
+    unless ( $ENV{'AE_LOG'} || $ENV{'PERL_ANYEVENT_LOG'} ) {
+        $ENV{'PERL_ANYEVENT_LOG'} = $conf->{'perl_anyevent_log'}
+          if ( $conf->{'perl_anyevent_log'} );
+    }
 
     %alias    = ();
     %devcodes = ();
@@ -137,6 +158,8 @@ sub read_config {
         my %tmp = %{ $conf->{devices}{$alias} };
 
         my $type = defined $tmp{'type'} ? lc $tmp{'type'} : '';
+        $type = defined $types{$type} ? $types{$type} : 0;
+
         my $retain = is_true( $tmp{'retain'} );
 
         my @devcodes;
@@ -156,9 +179,12 @@ sub read_config {
             foreach my $i ( 0 .. scalar @codes ) {
                 next unless ( $codes[$i] );
                 push( @devcodes, $house . $i );
-                if ( defined $types{$type} ) {
-                    $lights{$house}{$i} = 1 if ( $types{$type} == 2 );
-                    $appls{$house}{$i}  = 1 if ( $types{$type} >= 1 );
+                if ( $type == 2 ) {
+                    $lights{$house}{$i} = 1;
+                    $appls{$house}{$i}  = 1;
+                }
+                elsif ( $type == 1 ) {
+                    $appls{$house}{$i} = 1;
                 }
             }
         }
@@ -204,8 +230,12 @@ sub read_config {
     #exit 0;
 ############################################################################
 
-    $config_mtime   = stat($mm_config)->mtime;
-    $config_updated = Time::HiRes::time;
+}
+
+sub read_config {
+
+    read_config_file();
+    $config_mtime = stat($mm_config)->mtime;
 
     # Environment overrides config file
     foreach (@fromenv) {
@@ -216,6 +246,8 @@ sub read_config {
     foreach (@boolopts) {
         $config{$_} = is_true( $config{$_} );
     }
+    $config_updated = Time::HiRes::time;
+    $verbose = 1 if ( $config{verbose} );
 }
 
 sub changed_config {
@@ -264,17 +296,6 @@ sub str_range {
     }
     return @arr;
 }
-
-read_config();
-
-my $mqtt = AnyEvent::MQTT->new(
-    host             => $config{mqtt_host},
-    port             => $config{mqtt_port},
-    user_name        => $config{mqtt_user},
-    password         => $config{mqtt_password},
-    on_error         => \&mqtt_error_cb,
-    keep_alive_timer => 60,
-);
 
 sub mqtt_error_cb {
     my ( $fatal, $message ) = @_;
@@ -411,6 +432,21 @@ sub receive_mqtt_set {
     }
 }
 
+sub load_state {
+    return unless ( length $config{cache_dir} > 0 );
+
+    my $cache = $config{cache_dir} . '/states.json';
+    if ( open( FH, '<', $cache ) ) {
+        my $text = join( '', <FH> );
+        close FH;
+        my $tmp = JSON::PP->new->decode($text);
+        %states = %{$tmp} if ( defined $tmp );
+    }
+    else {
+        AE::log error => "Unable to open $cache: $!";
+    }
+}
+
 sub store_state {
     my ( $device, $state ) = @_;
 
@@ -418,13 +454,15 @@ sub store_state {
 
     $states{$device} = $state;
 
-    my $cache = $config{cache_dir} . '/states.json';
-    if ( open( FH, '>', $cache ) ) {
-        print FH JSON::PP->new->utf8->canonical->pretty->encode( \%states );
-        close(FH);
-    }
-    else {
-        AE::log error => "Unable to open $cache: $!";
+    if ( length $config{cache_dir} > 0 ) {
+        my $cache = $config{cache_dir} . '/states.json';
+        if ( open( FH, '>', $cache ) ) {
+            print FH JSON::PP->new->utf8->canonical->pretty->encode( \%states );
+            close(FH);
+        }
+        else {
+            AE::log error => "Unable to open $cache: $!";
+        }
     }
 }
 
@@ -599,6 +637,57 @@ sub process_x10_cmd {
     }
 }
 
+sub hass_publish_all() {
+    for my $alias ( sort( keys %alias ) ) {
+        my %tmp = %{ $alias{$alias} };
+
+        my $type = defined $types{ $tmp{type} } ? $types{ $tmp{type} } : 0;
+        my $hass_type = '';
+        if    ( $type == 2 ) { $hass_type = 'light'; }
+        elsif ( $type == 3 ) { $hass_type = 'sensor'; }
+        elsif ( $type == 1 || $type == 4 ) { $hass_type = 'switch'; }
+        else                               { next; }
+
+        my $id = $config{hass_id_prefix} . '.' . $hass_type . '.' . $alias;
+
+        my %attr = (
+            command_topic => $config{mqtt_prefix} . '/' . $alias . '/set',
+            device        => {
+                identifiers => $id,
+                name        => $tmp{name}
+            },
+            name        => $tmp{name},
+            payload_off => 'off',
+            payload_on  => 'on',
+            state_topic => $config{mqtt_prefix} . '/' . $alias . '/state',
+            unique_id   => $id
+        );
+
+        $mqtt->publish(
+            topic => $config{hass_topic_prefix} . '/'
+              . $hass_type . '/'
+              . $alias
+              . '/config',
+            message => JSON::PP->new->utf8->canonical->encode( \%attr ),
+            retain  => $config{hass_retain},
+        );
+    }
+}
+
+########################################################################
+
+read_config();
+load_state();
+
+$mqtt = AnyEvent::MQTT->new(
+    host             => $config{mqtt_host},
+    port             => $config{mqtt_port},
+    user_name        => $config{mqtt_user},
+    password         => $config{mqtt_password},
+    on_error         => \&mqtt_error_cb,
+    keep_alive_timer => 60,
+);
+
 $mqtt->subscribe(
     topic    => "$config{mqtt_prefix}/+/set",
     callback => \&receive_mqtt_set
@@ -644,44 +733,7 @@ if ( $config{hass_discovery_enable} ) {
       );
 }
 
-#print Dumper \%config, \%lights, \%appls, \%devcodes, \%alias;
 AE::log debug => Dumper( \%config );
-
-sub hass_publish_all() {
-    for my $alias ( sort( keys %alias ) ) {
-        my %tmp = %{ $alias{$alias} };
-
-        my $type = defined $types{ $tmp{type} } ? $types{ $tmp{type} } : 0;
-        my $hass_type = '';
-        if    ( $type == 2 ) { $hass_type = 'light'; }
-        elsif ( $type == 1 ) { $hass_type = 'switch'; }
-        else                 { next; }
-
-        my $id = $config{hass_id_prefix} . '.' . $hass_type . '.' . $alias;
-
-        my %attr = (
-            command_topic => $config{mqtt_prefix} . '/' . $alias . '/set',
-            device        => {
-                identifiers => $id,
-                name        => $tmp{name}
-            },
-            name        => $tmp{name},
-            payload_off => 'off',
-            payload_on  => 'on',
-            state_topic => $config{mqtt_prefix} . '/' . $alias . '/state',
-            unique_id   => $id
-        );
-
-        $mqtt->publish(
-            topic => $config{hass_topic_prefix} . '/'
-              . $hass_type . '/'
-              . $alias
-              . '/config',
-            message => JSON::PP->new->utf8->canonical->encode( \%attr ),
-            retain  => $config{hass_retain},
-        );
-    }
-}
 
 # first, connect to the host
 $handle = new AnyEvent::Handle
@@ -711,10 +763,7 @@ $handle->on_read(
 
 # Watch config file for changes
 
-my $dirname  = dirname($mm_config);
-my $basename = basename($mm_config);
-
-AE::log debug => "Watch config file $dirname $basename";
+AE::log debug => "Watch config file $mm_config";
 
 my $conf_monitor = AnyEvent->timer(
     after    => 30.0,
