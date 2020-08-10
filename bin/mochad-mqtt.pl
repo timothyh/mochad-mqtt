@@ -67,9 +67,13 @@ my %cmds = (
     lightsoff => 'all_lights_off',
 );
 
-# 1 => appliance, 2 => light
 #
-# Device types 1 == appliance, 2 == light, 3 => sensor, 4 => remote/scene controller
+# Device types
+# 1 == appliance - state recorded, responds to allunitson/off
+# 2 == light - state recorded, responds to allunitson/off and alllightson/off
+# 3 => sensor - state recorded, input only
+# 4 => remote/scene controller - state not recorded, input only
+#
 my %types = (
     sensor    => 3,
     stdam     => 1,
@@ -467,16 +471,18 @@ my $state_changed = 0;
 sub save_state {
     my ( $device, $status ) = @_;
 
-    return
-      if ( exists $states{$device}
+    $state_changed = 1
+      unless ( exists $states{$device}
         && $states{$device}{state} eq $status->{state} );
 
     my %tmp;
     $tmp{state} = $status->{state};
-    $tmp{timestamp} = strftime( "%Y-%m-%dT%H:%M:%S", localtime );
+    $tmp{timestamp} =
+      defined $status->{timestamp}
+      ? $status->{timestamp}
+      : strftime( "%Y-%m-%dT%H:%M:%S", localtime );
 
     $states{$device} = \%tmp;
-    $state_changed = 1;
 }
 
 sub store_state {
@@ -509,7 +515,6 @@ sub send_mqtt_status {
     return if ( $json_text eq $prev_text );
 
     if ( defined( $status->{state} ) ) {
-        save_state( $device, $status );
 
         # Short form
         send_mqtt_message( "$device/state", $status->{state}, 0 );
@@ -621,15 +626,21 @@ sub process_x10_cmd {
         $status{'instance'} = $config{mm_instance};
 
         my $alias;
+        my $type = 0;
         if ( defined $devcodes{ uc $device } ) {
             $alias = $devcodes{ uc $device };
             $status{'alias'} = $alias;
+            my %tmp = %{ $alias{$alias} };
+            $type = defined $tmp{type} ? $tmp{type} : 0;
         }
         else {
             $alias = $device;
         }
         send_mqtt_status( $alias, \%status );
-        store_state();
+        if ( $type == 1 || $type == 2 || $type == 3 ) {
+            save_state( $alias, \%status );
+            store_state();
+        }
     }
     elsif ( $device =~ m{^[a-z]$} ) {
         my %status;
@@ -642,12 +653,10 @@ sub process_x10_cmd {
         send_mqtt_status( $house, \%status, 0 );
 
         if ( $cmd =~ m{off$} ) {
-            $status{'command'} = 'off';
-            $status{'state'}   = 'off';
+            $status{'state'} = 'off';
         }
         else {
-            $status{'command'} = 'on';
-            $status{'state'}   = 'on';
+            $status{'state'} = 'on';
         }
         my @unitcodes;
         if ( $cmd =~ m{lights} ) {
@@ -656,12 +665,20 @@ sub process_x10_cmd {
         else {
             @unitcodes = sort( { $a <=> $b } keys %{ $appls{$house} } );
         }
+
+        my %published;
         for my $i (@unitcodes) {
             $status{'unitcode'} = $i;
-            my $alias = "$house$i";
-            $alias = $devcodes{$alias} if defined $devcodes{$alias};
+            my $device = "$house$i";
+            my $alias =
+              defined $devcodes{$device} ? $devcodes{$device} : $device;
+            next if ( $published{$alias} );
             $status{'alias'} = $alias;
+
             send_mqtt_status( $alias, \%status );
+            save_state( $alias, \%status );
+
+            $published{$alias} = 1;
         }
         store_state();
     }
@@ -717,14 +734,18 @@ sub hass_publish_all() {
     foreach my $code ( keys %devcodes ) {
         my $alias = $devcodes{$code};
         if ( exists $states{$alias} ) {
-            my %status;
-            $status{alias}     = $alias;
-            $status{timestamp} = $states{$alias}{timestamp};
-            $status{state}     = $states{$alias}{state};
-            $status{instance}  = $config{mm_instance};
-            send_mqtt_status( $alias, \%status );
-        }
+            my %tmp = %{ $alias{$alias} };
+            my $type = defined $tmp{type} ? $tmp{type} : 0;
 
+            if ( $type == 1 || $type == 2 || $type == 3 ) {
+                my %status;
+                $status{alias}     = $alias;
+                $status{timestamp} = $states{$alias}{timestamp};
+                $status{state}     = $states{$alias}{state};
+                $status{instance}  = $config{mm_instance};
+                send_mqtt_status( $alias, \%status );
+            }
+        }
     }
 
 }
