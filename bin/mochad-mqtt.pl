@@ -151,14 +151,21 @@ sub read_config_file {
     }
     delete $conf->{'ignore'};
     for my $alias ( keys %{ $conf->{'devices'} } ) {
-        if ( length($alias) <= 2 ) {
-            AE::log error => "Name length must be 3 chars or more: $alias";
-            next;
+        my $err = 0;
+        if ( length($alias) <= 3 ) {
+            AE::log error => "Name must be 4 chars or more: $alias";
+            $err = 1;
         }
         my %tmp = %{ $conf->{devices}{$alias} };
 
         my $type = defined $tmp{'type'} ? lc $tmp{'type'} : '';
         $type = defined $types{$type} ? $types{$type} : 0;
+
+        my $repeat = defined( $tmp{'repeat'} ) ? $tmp{'repeat'} : 0;
+        if ( $repeat < 0 || $repeat > 9 ) {
+            AE::log error => "$alias: Bad repeat value: $repeat";
+            $err = 1;
+        }
 
         my $retain = is_true( $tmp{'retain'} );
 
@@ -167,11 +174,10 @@ sub read_config_file {
         my @tmpcode = defined $tmp{'codes'} ? $tmp{'codes'} : ();
         push( @tmpcode, $tmp{'code'} ) if ( defined $tmp{'code'} );
 
-        my $err = 0;
         for my $code (@tmpcode) {
             $code = uc $code;
             unless ( $code =~ m{([A-Za-z])([\d,-]+)} ) {
-                AE::log error => "Bad device definition: $code";
+                AE::log error => "$alias: Bad device definition: $code";
                 $err = 1;
             }
             my $house = uc $1;
@@ -202,9 +208,12 @@ sub read_config_file {
         push( @{ $alias{$alias}{'codes'} }, sort @devcodes );
 
         $retain{$alias} = 1 if ($retain);
-        $alias{$alias}{'retain'} = $retain;
-        $alias{$alias}{'name'}   = $name;
-        $alias{$alias}{'type'}   = $type;
+        $alias{$alias}{'retain'}       = $retain;
+        $alias{$alias}{'name'}         = $name;
+        $alias{$alias}{'type'}         = $type;
+        $alias{$alias}{'repeat'}       = $repeat;
+        $alias{$alias}{'device_class'} = $tmp{'device_class'}
+          if ( defined $tmp{'device_class'} );
 
         for my $code (@devcodes) {
             $devcodes{$code} = $alias;
@@ -248,6 +257,8 @@ sub read_config {
     }
     $config_updated = Time::HiRes::time;
     $verbose = 1 if ( $config{verbose} );
+
+    AE::log debug => "Devices = " . join( ' ', sort( keys %alias ) );
 }
 
 sub changed_config {
@@ -309,7 +320,7 @@ sub mqtt_error_cb {
 my @delay_timer;
 
 sub delay_write {
-    my ( $handle, $message ) = @_;
+    my ( $handle, $message, $repeat ) = @_;
     my $delay = 0.0;
 
     if ( defined( $config{mm_delay} ) && $config{mm_delay} > 0 ) {
@@ -324,18 +335,21 @@ sub delay_write {
           "Instance => $config{mm_instance} Sum => $sum Delay => $delay";
     }
 
-    if ( $delay > 0.0 ) {
-        my $timer_offset = scalar @delay_timer;
-        $delay_timer[$timer_offset] = AnyEvent->timer(
-            after => $delay,
-            cb    => sub {
-                $handle->push_write($message);
-                delete $delay_timer[$timer_offset];
-            }
-        );
-    }
-    else {
-        $handle->push_write($message);
+    for ( my $i = 0 ; $i <= $repeat ; $i++ ) {
+        if ( $delay > 0.0 ) {
+            my $timer_offset = scalar @delay_timer;
+            $delay_timer[$timer_offset] = AnyEvent->timer(
+                after => $delay,
+                cb    => sub {
+                    $handle->push_write($message);
+                    delete $delay_timer[$timer_offset];
+                }
+            );
+        }
+        else {
+            $handle->push_write($message);
+        }
+        $delay += $config{repeat_interval};
     }
 }
 
@@ -350,7 +364,7 @@ sub receive_passthru_send {
         AE::log debug => "Received topic: \"$topic\" message: \"$message\"";
 
         AE::log info => "Passthru: Command => \"$message\"";
-        delay_write( $handle, $message . "\r" );
+        delay_write( $handle, $message . "\r", 0 );
     }
     else {
         AE::log debug =>
@@ -404,12 +418,13 @@ sub receive_mqtt_set {
 
     if ( defined $cmds{$payload} ) {
         if ( defined $alias{$device} ) {
+            my $repeat = $alias{$device}{repeat};
             foreach ( @{ $alias{$device}{codes} } ) {
                 unless ( $ignore{$_} ) {
                     AE::log info =>
                       "Switching device $_ $payload => $cmds{$payload}";
                     delay_write( $handle,
-                        "pl " . $_ . ' ' . $cmds{$payload} . "\r" );
+                        "pl " . $_ . ' ' . $cmds{$payload} . "\r", $repeat );
                 }
             }
         }
@@ -418,7 +433,7 @@ sub receive_mqtt_set {
             unless ( $ignore{$device} ) {
                 AE::log info =>
                   "Switching device $device $payload => $cmds{$payload}";
-                delay_write( $handle, "pl $device $cmds{$payload}\r" );
+                delay_write( $handle, "pl $device $cmds{$payload}\r", 0 );
             }
         }
         else {
@@ -447,23 +462,34 @@ sub load_state {
     }
 }
 
+my $state_changed = 0;
+
+sub save_state {
+    my ( $device, $status ) = @_;
+
+    my %tmp;
+    $tmp{state}     = $status->{state};
+    $tmp{timestamp} = $status->{timestamp};
+
+    $states{$device} = \%tmp;
+    $state_changed = 1;
+}
+
 sub store_state {
-    my ( $device, $state ) = @_;
-
-    return if ( defined( $states{$device} ) && $states{$device} eq $state );
-
-    $states{$device} = $state;
-
-    if ( length $config{cache_dir} > 0 ) {
-        my $cache = $config{cache_dir} . '/states.json';
-        if ( open( FH, '>', $cache ) ) {
-            print FH JSON::PP->new->utf8->canonical->pretty->encode( \%states );
-            close(FH);
-        }
-        else {
-            AE::log error => "Unable to open $cache: $!";
+    if ($state_changed) {
+        if ( length $config{cache_dir} > 0 ) {
+            my $cache = $config{cache_dir} . '/states.json';
+            if ( open( FH, '>', $cache ) ) {
+                print FH JSON::PP->new->utf8->canonical->pretty->encode(
+                    \%states );
+                close(FH);
+            }
+            else {
+                AE::log error => "Unable to open $cache: $!";
+            }
         }
     }
+    $state_changed = 0;
 }
 
 my $prev_text = '';
@@ -479,10 +505,10 @@ sub send_mqtt_status {
     return if ( $json_text eq $prev_text );
 
     if ( defined( $status->{state} ) ) {
+        save_state( $device, $status );
 
         # Short form
         send_mqtt_message( "$device/state", $status->{state}, 0 );
-        store_state( $device, $status->{'state'} );
     }
 
     # Long form
@@ -595,6 +621,7 @@ sub process_x10_cmd {
             $alias = $device;
         }
         send_mqtt_status( $alias, \%status );
+        store_state();
     }
     elsif ( $device =~ m{^[a-z]$} ) {
         my %status;
@@ -629,6 +656,7 @@ sub process_x10_cmd {
             $status{'alias'} = $alias;
             send_mqtt_status( $alias, \%status );
         }
+        store_state();
     }
     else {
         AE::log error => "unexpected $device: $cmd";
@@ -641,18 +669,19 @@ sub hass_publish_all() {
     for my $alias ( sort( keys %alias ) ) {
         my %tmp = %{ $alias{$alias} };
 
-        my $type = defined $types{ $tmp{type} } ? $types{ $tmp{type} } : 0;
+        my $type = defined $tmp{type} ? $tmp{type} : 0;
         my $hass_type = '';
-        if    ( $type == 2 ) { $hass_type = 'light'; }
-        elsif ( $type == 3 ) { $hass_type = 'sensor'; }
-        elsif ( $type == 1 || $type == 4 ) { $hass_type = 'switch'; }
-        else                               { next; }
+
+        if    ( $type == 1 ) { $hass_type = 'switch'; }
+        elsif ( $type == 2 ) { $hass_type = 'light'; }
+        elsif ( $type == 3 ) { $hass_type = 'binary_sensor'; }
+        elsif ( $type == 4 ) { next; }
+        else                 { next; }
 
         my $id = $config{hass_id_prefix} . '.' . $hass_type . '.' . $alias;
 
         my %attr = (
-            command_topic => $config{mqtt_prefix} . '/' . $alias . '/set',
-            device        => {
+            device => {
                 identifiers => $id,
                 name        => $tmp{name}
             },
@@ -663,6 +692,12 @@ sub hass_publish_all() {
             unique_id   => $id
         );
 
+        if ( $type == 1 || $type == 2 ) {
+            $attr{command_topic} = $config{mqtt_prefix} . '/' . $alias . '/set';
+        }
+        $attr{device_class} = $tmp{'device_class'}
+          if ( defined $tmp{'device_class'} );
+
         $mqtt->publish(
             topic => $config{hass_topic_prefix} . '/'
               . $hass_type . '/'
@@ -672,6 +707,19 @@ sub hass_publish_all() {
             retain  => $config{hass_retain},
         );
     }
+    foreach my $code ( keys %devcodes ) {
+        my $alias = $devcodes{$code};
+        if ( exists $states{$alias} ) {
+            my %status;
+            $status{alias}    = $alias;
+            $status{timestamp} = $states{$alias}{timestamp};
+            $status{state}     = $states{$alias}{state};
+            $status{instance}  = $config{mm_instance};
+            send_mqtt_status( $alias, \%status );
+        }
+
+    }
+
 }
 
 ########################################################################
