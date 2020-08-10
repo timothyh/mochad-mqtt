@@ -467,9 +467,13 @@ my $state_changed = 0;
 sub save_state {
     my ( $device, $status ) = @_;
 
+    return
+      if ( exists $states{$device}
+        && $states{$device}{state} eq $status->{state} );
+
     my %tmp;
-    $tmp{state}     = $status->{state};
-    $tmp{timestamp} = $status->{timestamp};
+    $tmp{state} = $status->{state};
+    $tmp{timestamp} = strftime( "%Y-%m-%dT%H:%M:%S", localtime );
 
     $states{$device} = \%tmp;
     $state_changed = 1;
@@ -516,8 +520,13 @@ sub send_mqtt_status {
 
     AE::log debug => "$device retain: $retain";
 
-    send_mqtt_message( $device, $json_text, $retain );
     $prev_text = $json_text;
+
+    $status->{timestamp} = strftime( "%Y-%m-%dT%H:%M:%S", localtime )
+      unless ( defined $status->{timestamp} );
+
+    my $text = JSON::PP->new->utf8->canonical->encode($status);
+    send_mqtt_message( $device, $text, $retain );
 }
 
 sub send_mqtt_message {
@@ -605,12 +614,11 @@ sub process_x10_cmd {
         my $house    = uc $1;
         my $unitcode = $2;
 
-        $status{'house'}     = $house;
-        $status{'unitcode'}  = $unitcode;
-        $status{'state'}     = $cmd;
-        $status{'command'}   = $cmd;
-        $status{'timestamp'} = strftime( "%Y-%m-%dT%H:%M:%S", localtime );
-        $status{'instance'}  = $config{mm_instance};
+        $status{'house'}    = $house;
+        $status{'unitcode'} = $unitcode;
+        $status{'state'}    = $cmd;
+        $status{'command'}  = $cmd;
+        $status{'instance'} = $config{mm_instance};
 
         my $alias;
         if ( defined $devcodes{ uc $device } ) {
@@ -627,10 +635,9 @@ sub process_x10_cmd {
         my %status;
         my $house = uc $device;
 
-        $status{'house'}     = $house;
-        $status{'command'}   = $cmd;
-        $status{'timestamp'} = strftime( "%Y-%m-%dT%H:%M:%S", localtime );
-        $status{'instance'}  = $config{mm_instance};
+        $status{'house'}    = $house;
+        $status{'command'}  = $cmd;
+        $status{'instance'} = $config{mm_instance};
 
         send_mqtt_status( $house, \%status, 0 );
 
@@ -711,7 +718,7 @@ sub hass_publish_all() {
         my $alias = $devcodes{$code};
         if ( exists $states{$alias} ) {
             my %status;
-            $status{alias}    = $alias;
+            $status{alias}     = $alias;
             $status{timestamp} = $states{$alias}{timestamp};
             $status{state}     = $states{$alias}{state};
             $status{instance}  = $config{mm_instance};
